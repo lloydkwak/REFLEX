@@ -235,3 +235,26 @@ __pycache__/
 # 5. OS Specific 
 Thumbs.db
 Desktop.ini
+
+# 6. Experiment Tracking (WandB / Tensorboard)
+wandb/
+remote_ckpt/
+
+# 7. Evaluation Results & Metrics
+eval_results/
+metrics/
+*.csv
+*.json
+
+# 8. macOS Specifics (Common in development)
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# 9. MuJoCo Key & Compiled Models
+mjkey.txt
+*.mjb
+
+# 10. Pretrained Model Cache (HuggingFace / Torch)
+.cache/huggingface/
+.cache/torch/

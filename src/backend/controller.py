@@ -38,7 +38,7 @@ class FaultTolerantOSC(OperationalSpaceController):
         M_inv = np.linalg.inv(M)
         
         # Current end-effector spatial velocity
-        ee_vel = np.concatenate([self.ee_pos_vel, self.ee_ori_vel]) # (6,)
+        ee_vel = J_full @ self.joint_vel # (6,)
         
         # 2. Apply Fault Masking
         # Nullify Jacobian columns to strictly isolate failed joints

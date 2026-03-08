@@ -205,3 +205,33 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+# --- REFLEX Specifics ---
+
+# 1. Large Datasets (Robomimic / HDF5) 
+data/
+*.hdf5
+*.h5
+
+# 2. Model Checkpoints
+checkpoints/
+*.pth
+*.ckpt
+*.bin
+
+# 3. Simulation Outputs
+outputs/
+recordings/
+*.mp4
+*.png
+*.jpg
+
+# 4. MuJoCo / Simulation Cache
+mjmodel.xml
+__pycache__/
+.mujoco_collections/
+
+# 5. OS Specific 
+Thumbs.db
+Desktop.ini

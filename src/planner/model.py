@@ -31,9 +31,7 @@ class ReflexFMNetwork(nn.Module):
         self.pose_dim = pose_dim
         
         # 1. Vision Encoder (Context Extractor)
-        # Using a lightweight ResNet18 for fast real-time inference
         resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        # Strip the classification head to output raw feature maps
         self.vision_encoder = nn.Sequential(*list(resnet.children())[:-1])
         
         # 2. Time & Pose Embeddings
@@ -47,7 +45,6 @@ class ReflexFMNetwork(nn.Module):
         self.context_emb = nn.Linear(context_dim, hidden_dim)
         
         # 3. Core Flow Matching MLP
-        # Fuses pose (x_t), context (c), and time (t) to model the vector field
         self.joint_mlp = nn.Sequential(
             nn.Linear(hidden_dim + hidden_dim + time_dim, hidden_dim),
             nn.Mish(),
@@ -58,17 +55,13 @@ class ReflexFMNetwork(nn.Module):
         )
         
         # 4. Dual Output Heads
-        # Velocity Head: Predicts the SE(3) vector field driving the Flow Matching ODE
         self.velocity_head = nn.Linear(hidden_dim, pose_dim)
-        
-        # Curvature Head: Predicts confidence/steepness to map to Stiffness (K_p)
-        # Softplus ensures strictly positive curvature values [0, inf)
         self.curvature_head = nn.Sequential(
             nn.Linear(hidden_dim, pose_dim),
             nn.Softplus()
         )
 
-    def forward(self, x_t, time, image):
+    def forward(self, x_t, time, image=None, context=None):
         """
         Args:
             x_t (torch.Tensor): Noisy pose at time t. Shape (B, 6).
@@ -79,24 +72,19 @@ class ReflexFMNetwork(nn.Module):
             v_pred (torch.Tensor): Predicted vector field (velocity). Shape (B, 6).
             kappa (torch.Tensor): Predicted field curvature. Shape (B, 6).
         """
-        # Extract visual context
-        with torch.no_grad(): # (Optional) Freeze resnet to save memory initially
-            c = self.vision_encoder(image) 
-            c = c.view(c.size(0), -1) # Flatten (B, 512)
-            
-        # Compute embeddings
+        if context is None:
+            with torch.no_grad():
+                c = self.vision_encoder(image) 
+                context = c.view(c.size(0), -1)
+
         t_emb = self.time_mlp(time)
         x_emb = self.pose_emb(x_t)
-        c_emb = self.context_emb(c)
+        c_emb = self.context_emb(context)
         
-        # Concatenate features: [x_t_emb, context_emb, t_emb]
         fused_features = torch.cat([x_emb, c_emb, t_emb], dim=-1)
-        
-        # Pass through joint MLP
         hidden = self.joint_mlp(fused_features)
         
-        # Output heads
         v_pred = self.velocity_head(hidden)
         kappa = self.curvature_head(hidden)
         
-        return v_pred, kappa
+        return v_pred, kappa, context

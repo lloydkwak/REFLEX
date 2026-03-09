@@ -23,55 +23,39 @@ class SinusoidalPosEmb(nn.Module):
 
 class ReflexFMNetwork(nn.Module):
     """
-    REFLEX Brain: SE(3) Flow Matching Neural Network.
-    Predicts the vector field v_theta(x_t, t | c) and the field curvature \kappa.
+    REFLEX Brain: SE(3) Flow Matching with Action Chunking (Tp=16).
+    Modified for 6-channel multi-view image input.
     """
-    def __init__(self, pose_dim=6, context_dim=512, time_dim=256, hidden_dim=512):
+    def __init__(self, pred_horizon=16, context_dim=512, time_dim=256, hidden_dim=512):
         super().__init__()
-        self.pose_dim = pose_dim
+        self.pose_dim = pred_horizon * 6 # 96
         
-        # 1. Vision Encoder (Context Extractor)
+        # 1. 6-Channel Vision Encoder
         resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        original_conv = resnet.conv1
+        resnet.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        with torch.no_grad():
+            resnet.conv1.weight[:, :3] = original_conv.weight
+            resnet.conv1.weight[:, 3:] = original_conv.weight
         self.vision_encoder = nn.Sequential(*list(resnet.children())[:-1])
         
-        # 2. Time & Pose Embeddings
+        # 2. Embeddings
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(time_dim),
-            nn.Linear(time_dim, time_dim * 2),
-            nn.Mish(),
+            nn.Linear(time_dim, time_dim * 2), nn.Mish(),
             nn.Linear(time_dim * 2, time_dim)
         )
-        self.pose_emb = nn.Linear(pose_dim, hidden_dim)
+        self.pose_emb = nn.Linear(self.pose_dim, hidden_dim)
         self.context_emb = nn.Linear(context_dim, hidden_dim)
         
-        # 3. Core Flow Matching MLP
+        # 3. Vector Field MLP
         self.joint_mlp = nn.Sequential(
-            nn.Linear(hidden_dim + hidden_dim + time_dim, hidden_dim),
-            nn.Mish(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Mish(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Mish()
-        )
-        
-        # 4. Dual Output Heads
-        self.velocity_head = nn.Linear(hidden_dim, pose_dim)
-        self.curvature_head = nn.Sequential(
-            nn.Linear(hidden_dim, pose_dim),
-            nn.Softplus()
+            nn.Linear(hidden_dim + hidden_dim + time_dim, hidden_dim), nn.Mish(),
+            nn.Linear(hidden_dim, hidden_dim), nn.Mish(),
+            nn.Linear(hidden_dim, self.pose_dim)
         )
 
     def forward(self, x_t, time, image=None, context=None):
-        """
-        Args:
-            x_t (torch.Tensor): Noisy pose at time t. Shape (B, 6).
-            time (torch.Tensor): Flow Matching time step t in [0, 1]. Shape (B,).
-            image (torch.Tensor): Camera observation. Shape (B, 3, H, W).
-            
-        Returns:
-            v_pred (torch.Tensor): Predicted vector field (velocity). Shape (B, 6).
-            kappa (torch.Tensor): Predicted field curvature. Shape (B, 6).
-        """
         if context is None:
             with torch.no_grad():
                 c = self.vision_encoder(image) 
@@ -81,10 +65,7 @@ class ReflexFMNetwork(nn.Module):
         x_emb = self.pose_emb(x_t)
         c_emb = self.context_emb(context)
         
-        fused_features = torch.cat([x_emb, c_emb, t_emb], dim=-1)
-        hidden = self.joint_mlp(fused_features)
+        fused = torch.cat([x_emb, c_emb, t_emb], dim=-1)
+        v_pred = self.joint_mlp(fused)
         
-        v_pred = self.velocity_head(hidden)
-        kappa = self.curvature_head(hidden)
-        
-        return v_pred, kappa, context
+        return v_pred, None, context

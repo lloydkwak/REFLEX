@@ -8,14 +8,17 @@ import torchvision.transforms as T
 class RobomimicSE3Dataset(Dataset):
     """
     Research-grade SE(3) dataset for Robomimic HDF5 files.
-    Optimized for memory efficiency and resource management.
+    Optimized for multi-view fusion and action chunking (prediction_horizon=16).
     """
-    def __init__(self, file_path):
+    def __init__(self, file_path, prediction_horizon=16):
         self.file_path = file_path
+        self.pred_horizon = prediction_horizon
         
+        # Normalize for 6-channel fused images (agentview + eye_in_hand)
         self.transform = T.Compose([
             T.Resize((224, 224), antialias=True),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            T.Normalize(mean=[0.485, 0.456, 0.406, 0.485, 0.456, 0.406], 
+                        std=[0.229, 0.224, 0.225, 0.229, 0.224, 0.225])
         ])
         
         self.index_map = []
@@ -37,27 +40,33 @@ class RobomimicSE3Dataset(Dataset):
 
         demo, step = self.index_map[idx]
         
-        # 1. Image Observation (Normalized to float32)
-        img = self.f[f'data/{demo}/obs/agentview_image'][step]
-        img = (img.transpose(2, 0, 1) / 255.0).astype(np.float32)
-        img_tensor = torch.from_numpy(img)
-        img_tensor = self.transform(img_tensor)
+        # 1. Multi-view Image Fusion
+        img_view = self.f[f'data/{demo}/obs/agentview_image'][step]
+        img_hand = self.f[f'data/{demo}/obs/robot0_eye_in_hand_image'][step]
         
-        horizon = 5
+        img_view = (img_view.transpose(2, 0, 1) / 255.0).astype(np.float32)
+        img_hand = (img_hand.transpose(2, 0, 1) / 255.0).astype(np.float32)
+        img_fused = np.concatenate([img_view, img_hand], axis=0) # Shape: (6, 224, 224)
+        
+        img_tensor = self.transform(torch.from_numpy(img_fused))
+        
+        # 2. Future Trajectory Generation (Action Chunking)
         max_step = self.f[f'data/{demo}/states'].shape[0] - 1
-        target_step = min(step + horizon, max_step)
+        trajectory = []
         
-        # 2. EE Pose [x, y, z, qx, qy, qz, qw]
-        pos = self.f[f'data/{demo}/obs/robot0_eef_pos'][target_step]
-        quat = self.f[f'data/{demo}/obs/robot0_eef_quat'][target_step]
-        
-        # 3. Convert to 6D (Position + Axis-Angle)
-        rot_vec = R.from_quat(quat).as_rotvec()
-        pose_6d = np.concatenate([pos, rot_vec]).astype(np.float32)
+        for i in range(self.pred_horizon):
+            t_step = min(step + i, max_step)
+            pos = self.f[f'data/{demo}/obs/robot0_eef_pos'][t_step]
+            quat = self.f[f'data/{demo}/obs/robot0_eef_quat'][t_step]
+            rot_vec = R.from_quat(quat).as_rotvec()
+            pose_6d = np.concatenate([pos, rot_vec])
+            trajectory.append(pose_6d)
+            
+        traj_tensor = torch.from_numpy(np.array(trajectory).flatten().astype(np.float32)) # Shape: (96,)
         
         return {
             "image": img_tensor, 
-            "pose": torch.from_numpy(pose_6d)
+            "pose": traj_tensor
         }
 
     def __del__(self):

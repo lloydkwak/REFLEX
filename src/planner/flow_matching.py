@@ -51,8 +51,7 @@ class ReflexFlowMatcher(nn.Module):
 
         t_eval = torch.linspace(0.0, 1.0, num_steps, device=device)
         trajectory = odeint(ode_func, x_0, t_eval, method='euler')
-        
-        x_1_pred = trajectory[-1]
-        _, kappa_pred, _ = self.model(x_1_pred, torch.ones(B, device=device), image=None, context=cached_context)        
-        
-        return x_1_pred, kappa_pred
+
+        x_1_traj = trajectory[-1].view(B, 16, 6)
+	
+	return x_1_traj, None

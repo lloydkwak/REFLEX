@@ -10,33 +10,27 @@ class FaultTolerantOSC(OperationalSpaceController):
     """
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # Binary mask for joint status (0: Operational, 1: Failed)
-        # Uses num_dof (number of robot joints) instead of control_dim (task space dim)
-        self.fault_mask = np.zeros(self.num_dof)
+        self.fault_mask = None
 
     def update_fault_mask(self, mask):
         """Updates the real-time fault status of robot joints."""
-        assert len(mask) == self.num_dof, f"Mask length must match num_dof: {self.num_dof}"
         self.fault_mask = np.array(mask)
 
     def compute_reflex_torques(self, x_IR, Kp, Kd):
         """
         Calculates task-space torques based on Intermediate Representation (IR).
         This bypasses the standard set_goal() to directly accept dynamic Field parameters.
-        
-        Args:
-            x_IR (np.ndarray): Target spatial velocity/displacement from FM (dim: 6).
-            Kp (np.ndarray): Adaptive stiffness matrix (dim: 6x6).
-            Kd (np.ndarray): Damping matrix (dim: 6x6).
-            
-        Returns:
-            torques (np.ndarray): Final joint torques (dim: N).
         """
         # 1. Acquire current kinematic and dynamic properties directly from robosuite
         J_full = np.vstack([self.J_pos, self.J_ori])  # (6, N)
         M = self.mass_matrix                          # (N, N)
         M_inv = np.linalg.inv(M)
         
+        num_joints = M.shape[0]
+        
+        if self.fault_mask is None:
+            self.fault_mask = np.zeros(num_joints)
+            
         # Current end-effector spatial velocity
         ee_vel = J_full @ self.joint_vel # (6,)
         
@@ -64,7 +58,7 @@ class FaultTolerantOSC(OperationalSpaceController):
         
         # 6. Null-space Projection for Energy Dissipation
         # N^T = I - J_a^T * J_bar^T (Dynamically consistent null-space projection matrix)
-        I_N = np.eye(self.num_dof)
+        I_N = np.eye(num_joints)
         Null_projector = I_N - (J_active.T @ J_bar.T)
         
         # Apply slight damping to active joints in the null-space to prevent oscillation

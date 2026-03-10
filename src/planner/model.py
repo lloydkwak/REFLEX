@@ -17,23 +17,37 @@ class SinusoidalPosEmb(nn.Module):
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
 
+class ResidualBlock(nn.Module):
+    def __init__(self, dim, hidden_scale=2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim * hidden_scale),
+            nn.Mish(),
+            nn.Linear(dim * hidden_scale, dim)
+        )
+        self.norm = nn.LayerNorm(dim)
+        self.act = nn.Mish()
+
+    def forward(self, x):
+        return self.act(self.norm(x + self.net(x)))
+
 class ReflexFMNetwork(nn.Module):
     """
     REFLEX Brain: SE(3) Flow Matching with Action Chunking (Tp=16).
-    Predicts trajectory fields from fused multi-view images.
+    [DP Standard] Upgraded to accept 12-channel visual inputs (obs_horizon=2).
     """
-    def __init__(self, pred_horizon=16, context_dim=512, time_dim=256, hidden_dim=512):
+    def __init__(self, pred_horizon=16, context_dim=512, time_dim=256, hidden_dim=512, joint_dim=1024, num_blocks=6):
         super().__init__()
-        self.pose_dim = pred_horizon * 6 # 96 dimensions for 16-step trajectory
+        self.pose_dim = pred_horizon * 6 
         
-        # 1. 6-Channel Vision Encoder Initialization
+        # 1. 12-Channel Vision Encoder Initialization (obs_horizon=2)
         resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
         original_conv = resnet.conv1
-        resnet.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        resnet.conv1 = nn.Conv2d(12, 64, kernel_size=7, stride=2, padding=3, bias=False)
         with torch.no_grad():
-            # Copy ImageNet weights to both views for balanced initialization
-            resnet.conv1.weight[:, :3] = original_conv.weight
-            resnet.conv1.weight[:, 3:] = original_conv.weight
+            # Broadcast ImageNet weights across all 12 input channels
+            for i in range(4):
+                resnet.conv1.weight[:, i*3:(i+1)*3] = original_conv.weight
         self.vision_encoder = nn.Sequential(*list(resnet.children())[:-1])
         
         # 2. Embedding Layers
@@ -45,12 +59,13 @@ class ReflexFMNetwork(nn.Module):
         self.pose_emb = nn.Linear(self.pose_dim, hidden_dim)
         self.context_emb = nn.Linear(context_dim, hidden_dim)
         
-        # 3. Vector Field Head
-        self.joint_mlp = nn.Sequential(
-            nn.Linear(hidden_dim + hidden_dim + time_dim, hidden_dim), nn.Mish(),
-            nn.Linear(hidden_dim, hidden_dim), nn.Mish(),
-            nn.Linear(hidden_dim, self.pose_dim)
-        )
+        # 3. Deep Residual Vector Field Head
+        in_dim = hidden_dim + hidden_dim + time_dim
+        layers = [nn.Linear(in_dim, joint_dim), nn.Mish()]
+        for _ in range(num_blocks):
+            layers.append(ResidualBlock(joint_dim))
+        layers.append(nn.Linear(joint_dim, self.pose_dim))
+        self.joint_net = nn.Sequential(*layers)
 
     def forward(self, x_t, time, image=None, context=None):
         if context is None:
@@ -63,6 +78,5 @@ class ReflexFMNetwork(nn.Module):
         c_emb = self.context_emb(context)
         
         h = torch.cat([x_emb, c_emb, t_emb], dim=-1)
-        v_pred = self.joint_mlp(h)
-        
+        v_pred = self.joint_net(h)
         return v_pred, None, context

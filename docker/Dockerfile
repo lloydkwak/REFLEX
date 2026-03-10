@@ -4,6 +4,12 @@ FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV MUJOCO_GL="egl"
 ENV PYTHONUNBUFFERED=1
+
+# [WandB Optimization] 
+ENV WANDB_PROJECT="REFLEX-Project"
+ENV WANDB_DIR="/workspace/wandb"
+ENV WANDB_CACHE_DIR="/workspace/.cache/wandb"
+
 # Export MuJoCo and NVIDIA paths for mujoco-py rendering
 ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/root/.mujoco/mujoco210/bin:/usr/lib/nvidia
 

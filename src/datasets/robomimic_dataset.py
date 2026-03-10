@@ -14,7 +14,7 @@ class RobomimicSE3Dataset(Dataset):
         self.file_path = file_path
         self.pred_horizon = prediction_horizon
         
-        # Normalize for 6-channel fused images (agentview + eye_in_hand)
+        # Normalization parameters for 6-channel fused images
         self.transform = T.Compose([
             T.Resize((224, 224), antialias=True),
             T.Normalize(mean=[0.485, 0.456, 0.406, 0.485, 0.456, 0.406], 
@@ -40,13 +40,13 @@ class RobomimicSE3Dataset(Dataset):
 
         demo, step = self.index_map[idx]
         
-        # 1. Multi-view Image Fusion
+        # 1. Multi-view Image Fusion (3rd person + wrist)
         img_view = self.f[f'data/{demo}/obs/agentview_image'][step]
         img_hand = self.f[f'data/{demo}/obs/robot0_eye_in_hand_image'][step]
         
         img_view = (img_view.transpose(2, 0, 1) / 255.0).astype(np.float32)
         img_hand = (img_hand.transpose(2, 0, 1) / 255.0).astype(np.float32)
-        img_fused = np.concatenate([img_view, img_hand], axis=0) # Shape: (6, 224, 224)
+        img_fused = np.concatenate([img_view, img_hand], axis=0)
         
         img_tensor = self.transform(torch.from_numpy(img_fused))
         
@@ -62,12 +62,9 @@ class RobomimicSE3Dataset(Dataset):
             pose_6d = np.concatenate([pos, rot_vec])
             trajectory.append(pose_6d)
             
-        traj_tensor = torch.from_numpy(np.array(trajectory).flatten().astype(np.float32)) # Shape: (96,)
+        traj_tensor = torch.from_numpy(np.array(trajectory).flatten().astype(np.float32))
         
-        return {
-            "image": img_tensor, 
-            "pose": traj_tensor
-        }
+        return {"image": img_tensor, "pose": traj_tensor}
 
     def __del__(self):
         if getattr(self, 'f', None) is not None:

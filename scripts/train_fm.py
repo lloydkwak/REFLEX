@@ -41,7 +41,7 @@ def train():
     parser.add_argument("--exp_name", type=str, default="OT-CFM-DP-Standard")
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--epochs", type=int, default=600)
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--device", type=str, default="cuda")
@@ -54,14 +54,17 @@ def train():
     save_dir = f"checkpoints/{args.task}/{args.exp_name}"
     os.makedirs(save_dir, exist_ok=True)
 
-    dataset = RobomimicSE3Dataset(args.data_path, prediction_horizon=args.tp)
-    train_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=8, pin_memory=True)
+    # 1. [DP Standard] Train & Validation Datasets Setup
+    train_dataset = RobomimicSE3Dataset(args.data_path, prediction_horizon=args.tp, split="train")
+    val_dataset = RobomimicSE3Dataset(args.data_path, prediction_horizon=args.tp, split="valid", stats=train_dataset.stats)
+    
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=8, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
     model = ReflexFMNetwork(pred_horizon=args.tp).to(args.device)
     fm_engine = ReflexFlowMatcher(model).to(args.device) 
     ema = EMA(model, decay=args.ema_decay)
     
-    # 1. [DP Standard] Parameter Grouping for Vision Backbone LR Separation
     vision_params = []
     head_params = []
     for name, param in model.named_parameters():
@@ -71,22 +74,22 @@ def train():
             head_params.append(param)
             
     optimizer = torch.optim.AdamW([
-        {"params": vision_params, "lr": 1e-5}, # Protect pre-trained weights
-        {"params": head_params, "lr": args.lr} # Aggressive learning for policy head
+        {"params": vision_params, "lr": 1e-5}, 
+        {"params": head_params, "lr": args.lr} 
     ], weight_decay=1e-6)
 
-    # 2. [DP Standard] Linear Warmup + Step Decay Scheduler
     warmup_scheduler = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=5)
     decay_scheduler = StepLR(optimizer, step_size=100, gamma=0.5)
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, decay_scheduler], milestones=[5])
 
-    best_loss = float('inf')
+    best_val_loss = float('inf')
 
     for epoch in range(args.epochs):
+        # ==================== TRAIN PHASE ====================
         model.train()
-        epoch_loss = 0
+        train_loss = 0
         
-        with tqdm(train_loader, desc=f"Epoch {epoch}") as pbar:
+        with tqdm(train_loader, desc=f"Epoch {epoch} [Train]") as pbar:
             for batch in pbar:
                 img = batch["image"].to(args.device)  
                 pose = batch["pose"].to(args.device)  
@@ -99,26 +102,49 @@ def train():
                 optimizer.step()
                 ema.update()
                 
-                epoch_loss += loss.item()
+                train_loss += loss.item()
                 pbar.set_postfix(loss=loss.item())
-                wandb.log({"iter_loss": loss.item()})
+                wandb.log({"iter_train_loss": loss.item()})
 
-        avg_loss = epoch_loss / len(train_loader)
+        avg_train_loss = train_loss / len(train_loader)
         scheduler.step()
         
-        wandb.log({"epoch_loss": avg_loss, "lr_head": optimizer.param_groups[1]['lr'], "epoch": epoch})
-        print(f"Epoch {epoch} Finished. Avg Loss: {avg_loss:.6f}")
+        # ==================== VALIDATION PHASE ====================
+        model.eval()
+        val_loss = 0
+        
+        with torch.no_grad():
+            with tqdm(val_loader, desc=f"Epoch {epoch} [Valid]") as pbar:
+                for batch in pbar:
+                    img = batch["image"].to(args.device)
+                    pose = batch["pose"].to(args.device)
+                    
+                    # Compute Validation Loss (No backprop)
+                    loss = fm_engine.compute_loss(x_1=pose, image=img)
+                    val_loss += loss.item()
+                    pbar.set_postfix(val_loss=loss.item())
+                    
+        avg_val_loss = val_loss / len(val_loader)
+        
+        # Logging
+        wandb.log({
+            "epoch": epoch,
+            "train_loss": avg_train_loss, 
+            "val_loss": avg_val_loss,
+            "lr_head": optimizer.param_groups[1]['lr']
+        })
+        print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
 
-        is_best = avg_loss < best_loss
+        # 4. [DP Standard] Save Checkpoint based on Validation Loss
+        is_best = avg_val_loss < best_val_loss
         if is_best:
-            best_loss = avg_loss
+            best_val_loss = avg_val_loss
             
-        # 3. [DP Standard] Inject Normalization Stats into Checkpoint
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'ema_shadow': ema.shadow,
-            'stats': dataset.stats, # Required for inference unscaling
+            'stats': train_dataset.stats, 
             'args': vars(args)
         }
         torch.save(checkpoint, os.path.join(save_dir, "latest.pth"))
@@ -128,9 +154,9 @@ def train():
             ema.apply_to_model(best_model_cpu)
             torch.save({
                 'model_state_dict': best_model_cpu.state_dict(),
-                'stats': dataset.stats
+                'stats': train_dataset.stats
             }, os.path.join(save_dir, "best_ema.pth"))
-            print(f"New Best Model Saved with Loss: {best_loss:.6f}")
+            print(f"New Best Model Saved! Val Loss: {best_val_loss:.6f}")
 
     wandb.finish()
 

@@ -26,15 +26,15 @@ import robosuite.controllers.controller_factory
 sys.modules['robosuite.controllers.controller_factory'].OperationalSpaceController = FaultTolerantOSC
 
 def preprocess_image(obs_buffer, transform, device):
-    """ [DP Standard] Stack t-1 and t observations into 12 channels. """
+    """ [DP Standard] Independent stacking for Late Fusion: (1, 4, 3, 224, 224) """
     fused_images = []
     for o in obs_buffer:
-        img_view = (o['agentview_image'].transpose(2, 0, 1) / 255.0).astype(np.float32)
-        img_hand = (o['robot0_eye_in_hand_image'].transpose(2, 0, 1) / 255.0).astype(np.float32)
-        fused_images.extend([img_view, img_hand])
+        fused_images.append((o['agentview_image'].transpose(2, 0, 1) / 255.0).astype(np.float32))
+        fused_images.append((o['robot0_eye_in_hand_image'].transpose(2, 0, 1) / 255.0).astype(np.float32))
         
-    img_fused = np.concatenate(fused_images, axis=0) # 12 Channels
-    return transform(torch.from_numpy(img_fused)).unsqueeze(0).to(device)
+    img_tensors = [transform(torch.from_numpy(img)) for img in fused_images]
+    img_tensor = torch.stack(img_tensors, dim=0).unsqueeze(0).to(device)
+    return img_tensor
 
 def evaluate():
     parser = argparse.ArgumentParser()
@@ -46,10 +46,9 @@ def evaluate():
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
-    print(f"[REFLEX] Loading DP-Standard Brain from {args.checkpoint}...")
+    print(f"[REFLEX] Loading DP-Perfect Brain from {args.checkpoint}...")
     ckpt = torch.load(args.checkpoint, map_location=args.device)
     
-    # Load Model and DP Min-Max Stats
     model = ReflexFMNetwork(pred_horizon=args.tp).to(args.device)
     model.load_state_dict(ckpt['model_state_dict'])
     model.eval()
@@ -63,7 +62,7 @@ def evaluate():
     
     transform = T.Compose([
         T.Resize((224, 224), antialias=True),
-        T.Normalize(mean=[0.485, 0.456, 0.406] * 4, std=[0.229, 0.224, 0.225] * 4)
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
     config = load_controller_config(default_controller="OSC_POSE")
@@ -78,10 +77,9 @@ def evaluate():
         env = FaultInjectionWrapper(env, max_faults=1, fault_type="lock", trigger_range=(0.3, 0.7))
 
     obs = env.reset()
-    # [DP Standard] Initialize Observation Buffer
     obs_buffer = deque(maxlen=2)
     obs_buffer.append(obs)
-    obs_buffer.append(obs) # Pad t-1 with initial state
+    obs_buffer.append(obs) 
     
     done = False
     step_count = 0
@@ -90,24 +88,35 @@ def evaluate():
     while not done and step_count < env.horizon:
         img_tensor = preprocess_image(obs_buffer, transform, args.device)
         
-        # Predict normalized trajectory [-1, 1]
-        pred_norm, _ = fm_engine.sample(image=img_tensor, num_steps=20)
+        # [DP Standard Fixed] Extract and Normalize Proprioceptive State accurately per dimension
+        states = []
+        for o in obs_buffer:
+            pos = o['robot0_eef_pos']
+            rot = R.from_quat(o['robot0_eef_quat']).as_rotvec()
+            state_single = np.concatenate([pos, rot]) # (6,)
+            # Apply exact 6D min-max stats before concatenation
+            state_norm_single = (state_single - stats['min']) / (stats['max'] - stats['min']) * 2.0 - 1.0
+            states.append(state_norm_single)
+            
+        state_norm = np.concatenate(states) # (12,)
+        state_tensor = torch.from_numpy(state_norm).float().unsqueeze(0).to(args.device)
         
-        # [DP Standard] Inverse Min-Max Normalization back to physical Delta bounds
+        # Predict normalized trajectory [-1, 1]
+        pred_norm, _ = fm_engine.sample(image=img_tensor, state=state_tensor, num_steps=20)
+        
+        # Inverse Min-Max Normalization -> Yields Absolute Space Poses
         pred_trajectory = (pred_norm + 1.0) / 2.0 * (action_max - action_min) + action_min
-        pred_trajectory = pred_trajectory.squeeze(0).cpu().numpy() 
+        pred_trajectory = pred_trajectory.squeeze(0).cpu().numpy() # (16, 6)
         
         for i in range(args.exec_steps):
             if step_count >= env.horizon: break
                 
             curr_pos = obs['robot0_eef_pos']
-            curr_rot_vec = R.from_quat(obs['robot0_eef_quat']).as_rotvec()
+            curr_quat = obs['robot0_eef_quat']
+            pose_curr = np.concatenate([curr_pos, curr_quat])
             
-            delta_pos = pred_trajectory[i][:3]
-            delta_rot_vec = pred_trajectory[i][3:]
-            
-            pose_curr = np.concatenate([curr_pos, obs['robot0_eef_quat']])
-            pose_target = np.concatenate([curr_pos + delta_pos, curr_rot_vec + delta_rot_vec])
+            # The prediction is the absolute target pose
+            pose_target = pred_trajectory[i]
             
             x_err_ir, Kp, Kd = translator.compute_ir(pose_curr, pose_target)
             
@@ -122,7 +131,7 @@ def evaluate():
             action = np.concatenate([np.zeros(6), [gripper_action]])
             
             obs, reward, done, info = env.step(action)
-            obs_buffer.append(obs) # Update temporal buffer
+            obs_buffer.append(obs) 
             env.render()
             
             step_count += 1

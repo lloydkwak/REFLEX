@@ -15,12 +15,14 @@ from src.planner.flow_matching import ReflexFlowMatcher
 from src.datasets.robomimic_dataset import RobomimicSE3Dataset
 
 def set_seed(seed):
+    """ Sets seeds for reproducibility across torch, numpy, and random. """
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
 class EMA:
+    """ Exponential Moving Average for weight smoothing. """
     def __init__(self, model, decay=0.999):
         self.model = model
         self.decay = decay
@@ -38,10 +40,10 @@ def train():
     parser = argparse.ArgumentParser(description="REFLEX Research-Grade Training Script")
     parser.add_argument("--project", type=str, default="REFLEX-Project")
     parser.add_argument("--task", type=str, required=True)
-    parser.add_argument("--exp_name", type=str, default="OT-CFM-DP-Standard")
+    parser.add_argument("--exp_name", type=str, default="OT-CFM-DP-Perfect")
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--epochs", type=int, default=600)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=64) 
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--device", type=str, default="cuda")
@@ -92,10 +94,11 @@ def train():
         with tqdm(train_loader, desc=f"Epoch {epoch} [Train]") as pbar:
             for batch in pbar:
                 img = batch["image"].to(args.device)  
+                state = batch["state"].to(args.device) # Extract Proprioceptive state
                 pose = batch["pose"].to(args.device)  
                 
                 optimizer.zero_grad()
-                loss = fm_engine.compute_loss(x_1=pose, image=img) 
+                loss = fm_engine.compute_loss(x_1=pose, image=img, state=state) 
                 
                 loss.backward()
                 clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -117,10 +120,11 @@ def train():
             with tqdm(val_loader, desc=f"Epoch {epoch} [Valid]") as pbar:
                 for batch in pbar:
                     img = batch["image"].to(args.device)
+                    state = batch["state"].to(args.device)
                     pose = batch["pose"].to(args.device)
                     
-                    # Compute Validation Loss (No backprop)
-                    loss = fm_engine.compute_loss(x_1=pose, image=img)
+                    # Compute Validation Loss
+                    loss = fm_engine.compute_loss(x_1=pose, image=img, state=state)
                     val_loss += loss.item()
                     pbar.set_postfix(val_loss=loss.item())
                     
@@ -135,7 +139,7 @@ def train():
         })
         print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
 
-        # 4. [DP Standard] Save Checkpoint based on Validation Loss
+        # 4. Save Checkpoint based on Validation Loss
         is_best = avg_val_loss < best_val_loss
         if is_best:
             best_val_loss = avg_val_loss

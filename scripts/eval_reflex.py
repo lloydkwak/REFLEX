@@ -26,7 +26,6 @@ import robosuite.controllers.controller_factory
 sys.modules['robosuite.controllers.controller_factory'].OperationalSpaceController = FaultTolerantOSC
 
 def preprocess_image(obs_buffer, transform, device):
-    """ [DP Standard] Independent stacking for Late Fusion: (1, 4, 3, 224, 224) """
     fused_images = []
     for o in obs_buffer:
         fused_images.append((o['agentview_image'].transpose(2, 0, 1) / 255.0).astype(np.float32))
@@ -46,8 +45,8 @@ def evaluate():
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
-    print(f"[REFLEX] Loading DP-Perfect Brain from {args.checkpoint}...")
-    ckpt = torch.load(args.checkpoint, map_location=args.device)
+    print(f"[REFLEX] Loading Brain from {args.checkpoint}...")
+    ckpt = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
     
     model = ReflexFMNetwork(pred_horizon=args.tp).to(args.device)
     model.load_state_dict(ckpt['model_state_dict'])
@@ -66,10 +65,11 @@ def evaluate():
     ])
 
     config = load_controller_config(default_controller="OSC_POSE")
+    # Configured for High-Frequency Real-time Control (500Hz)
     env = suite.make(
         env_name=args.task, robots="Panda", controller_configs=config,
-        has_renderer=True, has_offscreen_renderer=True, control_freq=20,
-        horizon=400, use_object_obs=False, use_camera_obs=True,
+        has_renderer=True, has_offscreen_renderer=True, control_freq=500,
+        horizon=10000, use_object_obs=False, use_camera_obs=True,
         camera_names=["agentview", "robot0_eye_in_hand"], camera_heights=224, camera_widths=224,
     )
     
@@ -81,6 +81,10 @@ def evaluate():
     obs_buffer.append(obs)
     obs_buffer.append(obs) 
     
+    gripper_buffer = deque(maxlen=2)
+    gripper_buffer.append(-1.0)
+    gripper_buffer.append(-1.0)
+    
     done = False
     step_count = 0
     success = False
@@ -88,37 +92,30 @@ def evaluate():
     while not done and step_count < env.horizon:
         img_tensor = preprocess_image(obs_buffer, transform, args.device)
         
-        # [DP Standard Fixed] Extract and Normalize Proprioceptive State accurately per dimension
         states = []
-        for o in obs_buffer:
+        for o, g in zip(obs_buffer, gripper_buffer):
             pos = o['robot0_eef_pos']
             rot = R.from_quat(o['robot0_eef_quat']).as_rotvec()
-            state_single = np.concatenate([pos, rot]) # (6,)
-            # Apply exact 6D min-max stats before concatenation
+            state_single = np.concatenate([pos, rot, [g]]) 
             state_norm_single = (state_single - stats['min']) / (stats['max'] - stats['min']) * 2.0 - 1.0
             states.append(state_norm_single)
             
-        state_norm = np.concatenate(states) # (12,)
+        state_norm = np.concatenate(states)
         state_tensor = torch.from_numpy(state_norm).float().unsqueeze(0).to(args.device)
         
-        # Predict normalized trajectory [-1, 1]
         pred_norm, _ = fm_engine.sample(image=img_tensor, state=state_tensor, num_steps=20)
         
-        # Inverse Min-Max Normalization -> Yields Absolute Space Poses
         pred_trajectory = (pred_norm + 1.0) / 2.0 * (action_max - action_min) + action_min
-        pred_trajectory = pred_trajectory.squeeze(0).cpu().numpy() # (16, 6)
+        pred_trajectory = pred_trajectory.squeeze(0).cpu().numpy()
         
         for i in range(args.exec_steps):
             if step_count >= env.horizon: break
                 
-            curr_pos = obs['robot0_eef_pos']
-            curr_quat = obs['robot0_eef_quat']
-            pose_curr = np.concatenate([curr_pos, curr_quat])
+            # Direct 6D Target Velocity and 1D Gripper State
+            vel_target = pred_trajectory[i][:6]
+            gripper_action = pred_trajectory[i][6]
             
-            # The prediction is the absolute target pose
-            pose_target = pred_trajectory[i]
-            
-            x_err_ir, Kp, Kd = translator.compute_ir(pose_curr, pose_target)
+            x_err_ir, Kp, Kd = translator.compute_ir(vel_target)
             
             x_err_ir[:3] = np.clip(x_err_ir[:3], -0.05, 0.05)
             x_err_ir[3:] = np.clip(x_err_ir[3:], -0.2, 0.2)
@@ -127,11 +124,11 @@ def evaluate():
             env.robots[0].controller.reflex_Kp = Kp
             env.robots[0].controller.reflex_Kd = Kd
             
-            gripper_action = 1.0 if obs['robot0_eef_pos'][2] < 0.85 else -1.0
             action = np.concatenate([np.zeros(6), [gripper_action]])
             
             obs, reward, done, info = env.step(action)
             obs_buffer.append(obs) 
+            gripper_buffer.append(gripper_action)
             env.render()
             
             step_count += 1

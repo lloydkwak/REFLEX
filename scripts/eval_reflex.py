@@ -52,9 +52,10 @@ def evaluate():
     model.load_state_dict(ckpt['model_state_dict'])
     model.eval()
     
+    # [Fix] Z-Score Inverse Normalization
     stats = ckpt['stats']
-    action_min = torch.from_numpy(stats['min']).to(args.device)
-    action_max = torch.from_numpy(stats['max']).to(args.device)
+    action_mean = torch.from_numpy(stats['mean']).to(args.device)
+    action_std = torch.from_numpy(stats['std']).to(args.device)
     
     fm_engine = ReflexFlowMatcher(model).to(args.device)
     translator = PotentialFieldTranslator(base_kp=150.0)
@@ -65,7 +66,6 @@ def evaluate():
     ])
 
     config = load_controller_config(default_controller="OSC_POSE")
-    # Configured for High-Frequency Real-time Control (500Hz)
     env = suite.make(
         env_name=args.task, robots="Panda", controller_configs=config,
         has_renderer=True, has_offscreen_renderer=True, control_freq=500,
@@ -97,7 +97,8 @@ def evaluate():
             pos = o['robot0_eef_pos']
             rot = R.from_quat(o['robot0_eef_quat']).as_rotvec()
             state_single = np.concatenate([pos, rot, [g]]) 
-            state_norm_single = (state_single - stats['min']) / (stats['max'] - stats['min']) * 2.0 - 1.0
+            # Z-Score Normalization
+            state_norm_single = (state_single - stats['mean']) / stats['std']
             states.append(state_norm_single)
             
         state_norm = np.concatenate(states)
@@ -105,13 +106,13 @@ def evaluate():
         
         pred_norm, _ = fm_engine.sample(image=img_tensor, state=state_tensor, num_steps=20)
         
-        pred_trajectory = (pred_norm + 1.0) / 2.0 * (action_max - action_min) + action_min
+        # [Fix] Z-Score Inverse Transformation
+        pred_trajectory = (pred_norm * action_std) + action_mean
         pred_trajectory = pred_trajectory.squeeze(0).cpu().numpy()
         
         for i in range(args.exec_steps):
             if step_count >= env.horizon: break
                 
-            # Direct 6D Target Velocity and 1D Gripper State
             vel_target = pred_trajectory[i][:6]
             gripper_action = pred_trajectory[i][6]
             

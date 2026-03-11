@@ -16,11 +16,13 @@ from src.envs.custom_env import FaultInjectionWrapper
 from src.backend.controller import FaultTolerantOSC
 
 def reflex_run_controller(self):
+    """ Diverts standard control to the REFLEX Potential Field framework. """
     if hasattr(self, 'reflex_x_IR'):
         return self.compute_reflex_torques(self.reflex_x_IR, self.reflex_Kp, self.reflex_Kd)
     from robosuite.controllers.osc import OperationalSpaceController
     return OperationalSpaceController.run_controller(self)
 
+# Monkey-patch to force Robosuite to use FT-OSC
 FaultTolerantOSC.run_controller = reflex_run_controller
 import robosuite.controllers.controller_factory
 sys.modules['robosuite.controllers.controller_factory'].OperationalSpaceController = FaultTolerantOSC
@@ -36,7 +38,7 @@ def preprocess_image(obs_buffer, transform, device):
     return img_tensor
 
 def evaluate():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="REFLEX Own FM Model Evaluation Script")
     parser.add_argument("--task", type=str, default="PickPlaceCan")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--mode", type=str, choices=["normal", "fault"], default="normal")
@@ -52,7 +54,6 @@ def evaluate():
     model.load_state_dict(ckpt['model_state_dict'])
     model.eval()
     
-    # [Fix] Z-Score Inverse Normalization
     stats = ckpt['stats']
     action_mean = torch.from_numpy(stats['mean']).to(args.device)
     action_std = torch.from_numpy(stats['std']).to(args.device)
@@ -60,8 +61,10 @@ def evaluate():
     fm_engine = ReflexFlowMatcher(model).to(args.device)
     translator = PotentialFieldTranslator(base_kp=150.0)
     
+    # Matches the Validation Transform from the Dataset
     transform = T.Compose([
-        T.Resize((224, 224), antialias=True),
+        T.Resize(256, antialias=True),
+        T.CenterCrop(224),
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
@@ -97,7 +100,6 @@ def evaluate():
             pos = o['robot0_eef_pos']
             rot = R.from_quat(o['robot0_eef_quat']).as_rotvec()
             state_single = np.concatenate([pos, rot, [g]]) 
-            # Z-Score Normalization
             state_norm_single = (state_single - stats['mean']) / stats['std']
             states.append(state_norm_single)
             
@@ -106,7 +108,6 @@ def evaluate():
         
         pred_norm, _ = fm_engine.sample(image=img_tensor, state=state_tensor, num_steps=20)
         
-        # [Fix] Z-Score Inverse Transformation
         pred_trajectory = (pred_norm * action_std) + action_mean
         pred_trajectory = pred_trajectory.squeeze(0).cpu().numpy()
         

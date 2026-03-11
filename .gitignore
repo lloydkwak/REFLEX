@@ -258,3 +258,60 @@ mjkey.txt
 # 10. Pretrained Model Cache (HuggingFace / Torch)
 .cache/huggingface/
 .cache/torch/
+
+# --- REFLEX Specifics ---
+
+# 1. Large Datasets (Robomimic / HDF5) 
+data/
+*.hdf5
+*.h5
+
+# 2. Model Checkpoints
+checkpoints/
+*.pth
+*.ckpt
+*.bin
+
+# 3. Simulation Outputs
+outputs/
+recordings/
+*.mp4
+*.png
+*.jpg
+
+# 4. MuJoCo / Simulation Cache
+mjmodel.xml
+__pycache__/
+.mujoco_collections/
+
+# 5. OS Specific 
+Thumbs.db
+Desktop.ini
+
+# 6. Experiment Tracking (WandB / Tensorboard)
+wandb/
+remote_ckpt/
+
+# 7. Evaluation Results & Metrics
+eval_results/
+metrics/
+*.csv
+*.json
+
+# 8. macOS Specifics (Common in development)
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# 9. MuJoCo Key & Compiled Models
+mjkey.txt
+*.mjb
+
+# 10. Pretrained Model Cache (HuggingFace / Torch)
+.cache/huggingface/
+
+# 11. Official Diffusion Policy Repository
+diffusion_policy/
+
+# 12. Temporary / External Evaluation Scripts
+scripts/eval_dp_reflex.py

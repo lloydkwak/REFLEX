@@ -4,7 +4,11 @@ import torchvision.models as models
 import math
 
 def replace_bn_with_gn(root_module):
-    """ Recursively replaces all BatchNorm2d layers with GroupNorm. """
+    """ 
+    Recursively replaces all BatchNorm2d layers with GroupNorm.
+    Essential for stabilizing visual representation learning in robotics
+    due to high correlation within episodic batches.
+    """
     for name, module in root_module.named_children():
         if isinstance(module, nn.BatchNorm2d):
             setattr(root_module, name, nn.GroupNorm(8, module.num_features))
@@ -12,7 +16,7 @@ def replace_bn_with_gn(root_module):
             replace_bn_with_gn(module)
 
 class SinusoidalPosEmb(nn.Module):
-    """ Standard Sinusoidal Positional Embedding for time conditioning. """
+    """ Standard Sinusoidal Positional Embedding for temporal encoding. """
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
@@ -27,14 +31,19 @@ class SinusoidalPosEmb(nn.Module):
         return emb
 
 class AdaLNTransformerBlock(nn.Module):
-    """ Transformer block with Adaptive Layer Normalization (FiLM). """
-    def __init__(self, hidden_dim, nhead):
+    """
+    Transformer block augmented with Adaptive Layer Normalization (FiLM).
+    Conditions the forward pass on global temporal variables via scale and shift modulation.
+    """
+    def __init__(self, hidden_dim, nhead, dropout=0.1):
         super().__init__()
-        self.attention = nn.MultiheadAttention(hidden_dim, nhead, batch_first=True)
+        self.attention = nn.MultiheadAttention(hidden_dim, nhead, dropout=dropout, batch_first=True)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 4),
             nn.GELU(),
-            nn.Linear(hidden_dim * 4, hidden_dim)
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.Dropout(dropout)
         )
         self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False)
         self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False)
@@ -60,9 +69,9 @@ class AdaLNTransformerBlock(nn.Module):
 
 class ReflexFMNetwork(nn.Module):
     """
-    REFLEX Brain: Flow Matching SE(3) + Gripper Network with AdaLN.
-    [Fix] Context tokens are now prepended (Prefix sequence) instead of mean-pooled.
-    AdaLN is purely driven by Time, mimicking state-of-the-art DiT architectures.
+    REFLEX Brain: DiT-style Flow Matching Network.
+    Employs Prefix Tokens for spatial conditioning and AdaLN for temporal conditioning.
+    Predicts 7-DOF targeted velocities (6D Spatial + 1D Gripper).
     """
     def __init__(self, pred_horizon=16, obs_horizon=2, num_cams=2, hidden_dim=256, time_dim=256):
         super().__init__()
@@ -87,8 +96,12 @@ class ReflexFMNetwork(nn.Module):
         self.action_emb = nn.Linear(self.pose_dim, hidden_dim)
         self.pos_emb = nn.Parameter(torch.zeros(1, pred_horizon, hidden_dim))
         
+        # Positional Embedding for Context Tokens (1 State + 4 Image = 5 Context Tokens)
+        num_context_tokens = 1 + (obs_horizon * num_cams)
+        self.context_pos_emb = nn.Parameter(torch.zeros(1, num_context_tokens, hidden_dim))
+        
         self.layers = nn.ModuleList([
-            AdaLNTransformerBlock(hidden_dim, nhead=8) for _ in range(6)
+            AdaLNTransformerBlock(hidden_dim, nhead=8, dropout=0.1) for _ in range(6)
         ])
         
         self.out_proj = nn.Linear(hidden_dim, self.pose_dim)
@@ -102,29 +115,25 @@ class ReflexFMNetwork(nn.Module):
                 img_flat = image.view(B * N, 3, 224, 224)
                 features = self.vision_encoder(img_flat).view(B, N, 512)
                 
-            cam_tokens = self.cam_proj(features) # (B, N, hidden_dim)
-            state_token = self.state_mlp(state).unsqueeze(1) # (B, 1, hidden_dim)
+            cam_tokens = self.cam_proj(features) 
+            state_token = self.state_mlp(state).unsqueeze(1) 
             
-            # Preserve independent tokens: (B, 1+N, hidden_dim)
             context_tokens = torch.cat([state_token, cam_tokens], dim=1) 
+            context_tokens = context_tokens + self.context_pos_emb
 
-        # Time token exclusively drives the AdaLN (Flow Modulation)
-        time_token = self.time_mlp(time) # (B, hidden_dim)
+        time_token = self.time_mlp(time) 
         global_cond = time_token 
         
-        # Action sequence
-        x_seq = self.action_emb(x_t) + self.pos_emb # (B, 16, hidden_dim)
+        x_seq = self.action_emb(x_t) + self.pos_emb 
         
-        # Prepend context tokens to form the full Transformer sequence
-        seq = torch.cat([context_tokens, x_seq], dim=1) # (B, 1+N+16, hidden_dim)
+        seq = torch.cat([context_tokens, x_seq], dim=1) 
         
         for layer in self.layers:
             seq = layer(seq, global_cond)
             
-        # Extract only the action sequence part from the outputs
         num_ctx = context_tokens.shape[1]
-        action_features = seq[:, num_ctx:, :] # (B, 16, hidden_dim)
+        action_features = seq[:, num_ctx:, :] 
         
-        v_pred = self.out_proj(action_features) # (B, 16, 7)
+        v_pred = self.out_proj(action_features) 
         
         return v_pred, None, context_tokens

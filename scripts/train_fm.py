@@ -15,14 +15,14 @@ from src.planner.flow_matching import ReflexFlowMatcher
 from src.datasets.robomimic_dataset import RobomimicSE3Dataset
 
 def set_seed(seed):
-    """ Sets seeds for reproducibility across torch, numpy, and random. """
+    """ Ensures reproducibility across distributed runs. """
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
 class EMA:
-    """ Exponential Moving Average for weight smoothing. """
+    """ Exponential Moving Average for robust policy execution. """
     def __init__(self, model, decay=0.999):
         self.model = model
         self.decay = decay
@@ -42,7 +42,7 @@ def train():
     parser.add_argument("--task", type=str, required=True)
     parser.add_argument("--exp_name", type=str, default="OT-CFM-DP-Perfect")
     parser.add_argument("--data_path", type=str, required=True)
-    parser.add_argument("--epochs", type=int, default=600)
+    parser.add_argument("--epochs", type=int, default=800)
     parser.add_argument("--batch_size", type=int, default=64) 
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--ema_decay", type=float, default=0.999)
@@ -56,7 +56,6 @@ def train():
     save_dir = f"checkpoints/{args.task}/{args.exp_name}"
     os.makedirs(save_dir, exist_ok=True)
 
-    # 1. [DP Standard] Train & Validation Datasets Setup
     train_dataset = RobomimicSE3Dataset(args.data_path, prediction_horizon=args.tp, split="train")
     val_dataset = RobomimicSE3Dataset(args.data_path, prediction_horizon=args.tp, split="valid", stats=train_dataset.stats)
     
@@ -78,7 +77,7 @@ def train():
     optimizer = torch.optim.AdamW([
         {"params": vision_params, "lr": 1e-5}, 
         {"params": head_params, "lr": args.lr} 
-    ], weight_decay=1e-6)
+    ], weight_decay=1e-4)
 
     warmup_scheduler = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=5)
     decay_scheduler = StepLR(optimizer, step_size=100, gamma=0.5)
@@ -87,14 +86,13 @@ def train():
     best_val_loss = float('inf')
 
     for epoch in range(args.epochs):
-        # ==================== TRAIN PHASE ====================
         model.train()
         train_loss = 0
         
         with tqdm(train_loader, desc=f"Epoch {epoch} [Train]") as pbar:
             for batch in pbar:
                 img = batch["image"].to(args.device)  
-                state = batch["state"].to(args.device) # Extract Proprioceptive state
+                state = batch["state"].to(args.device) 
                 pose = batch["pose"].to(args.device)  
                 
                 optimizer.zero_grad()
@@ -112,7 +110,6 @@ def train():
         avg_train_loss = train_loss / len(train_loader)
         scheduler.step()
         
-        # ==================== VALIDATION PHASE ====================
         model.eval()
         val_loss = 0
         
@@ -123,14 +120,12 @@ def train():
                     state = batch["state"].to(args.device)
                     pose = batch["pose"].to(args.device)
                     
-                    # Compute Validation Loss
                     loss = fm_engine.compute_loss(x_1=pose, image=img, state=state)
                     val_loss += loss.item()
                     pbar.set_postfix(val_loss=loss.item())
                     
         avg_val_loss = val_loss / len(val_loader)
         
-        # Logging
         wandb.log({
             "epoch": epoch,
             "train_loss": avg_train_loss, 
@@ -139,7 +134,6 @@ def train():
         })
         print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
 
-        # 4. Save Checkpoint based on Validation Loss
         is_best = avg_val_loss < best_val_loss
         if is_best:
             best_val_loss = avg_val_loss
